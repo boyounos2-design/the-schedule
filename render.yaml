@@ -1,0 +1,42 @@
+services:
+  # Backend API
+  - type: web
+    name: the-schedule-api
+    env: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: the-schedule-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_URL
+        fromService:
+          type: static
+          name: the-schedule-ui
+          property: url
+
+  # Frontend UI
+  - type: static
+    name: the-schedule-ui
+    env: static
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    publishDir: dist
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: the-schedule-api
+          property: url
+
+databases:
+  - name: the-schedule-db
+    plan: free

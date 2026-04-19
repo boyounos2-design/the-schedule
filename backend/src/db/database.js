@@ -9,13 +9,25 @@ let db;
 
 function getDb() {
   if (!db) {
-    const dir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    db = knex({
-      client: 'sqlite3',
-      connection: { filename: DB_PATH },
-      useNullAsDefault: true,
-    });
+    if (process.env.DATABASE_URL) {
+      // PostgreSQL (Production)
+      db = knex({
+        client: 'pg',
+        connection: {
+          connectionString: process.env.DATABASE_URL,
+          ssl: { rejectUnauthorized: false }
+        }
+      });
+    } else {
+      // SQLite (Development)
+      const dir = path.dirname(DB_PATH);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      db = knex({
+        client: 'sqlite3',
+        connection: { filename: DB_PATH },
+        useNullAsDefault: true,
+      });
+    }
   }
   return db;
 }
