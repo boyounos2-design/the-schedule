@@ -35,7 +35,7 @@ router.get('/excel', async (req, res) => {
     const schedules = await db('schedules as s')
       .join('users as u', 's.user_id', 'u.id')
       .select('s.date', 'u.name as doctor_name', 'u.specialty', 's.shift_type', 's.status')
-      .whereRaw("strftime('%Y-%m', s.date) = ?", [month])
+      .where('s.date', 'like', `${month}%`)
       .orderBy(['s.date', 'u.name', 's.shift_type']);
 
     const workbook = new ExcelJS.Workbook();
@@ -104,7 +104,7 @@ router.get('/attendance', async (req, res) => {
     const schedules = await db('schedules as s')
       .join('users as u', 's.user_id', 'u.id')
       .select('s.date', 'u.name as doctor_name', 'u.specialty', 's.shift_type')
-      .whereRaw("strftime('%Y-%m', s.date) = ?", [month])
+      .where('s.date', 'like', `${month}%`)
       .orderBy(['s.date', 'u.name']);
 
     const doc = new PDFDocument({ size: 'A4', margin: 40 });

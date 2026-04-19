@@ -16,7 +16,7 @@ router.get('/', async (req, res) => {
     let query = db('schedules as s')
       .join('users as u', 's.user_id', 'u.id')
       .select('s.*', 'u.name as doctor_name', 'u.specialty')
-      .whereRaw("strftime('%Y-%m', s.date) = ?", [month])
+      .where('s.date', 'like', `${month}%`)
       .orderBy(['s.date', 'u.name', 's.shift_type']);
 
     if (req.user.role === 'admin') {
@@ -43,7 +43,7 @@ router.post('/', async (req, res) => {
     // Check locked
     const lockedCount = await db('schedules')
       .where({ user_id: targetUserId })
-      .whereRaw("strftime('%Y-%m', date) = ?", [month])
+      .where('date', 'like', `${month}%`)
       .whereIn('status', ['submitted','locked'])
       .count('id as cnt')
       .first();
@@ -58,7 +58,7 @@ router.post('/', async (req, res) => {
 
     const usedRow = await db('schedules')
       .where({ user_id: targetUserId, shift_type })
-      .whereRaw("strftime('%Y-%m', date) = ?", [month])
+      .where('date', 'like', `${month}%`)
       .count('id as cnt').first();
 
     if (usedRow.cnt >= quota[shift_type]) {
@@ -108,7 +108,7 @@ router.post('/submit', async (req, res) => {
       .select('shift_type')
       .count('id as cnt')
       .where({ user_id: userId })
-      .whereRaw("strftime('%Y-%m', date) = ?", [month])
+      .where('date', 'like', `${month}%`)
       .groupBy('shift_type');
 
     const shiftMap = {};
@@ -126,7 +126,7 @@ router.post('/submit', async (req, res) => {
 
     await db('schedules')
       .where({ user_id: userId, status: 'draft' })
-      .whereRaw("strftime('%Y-%m', date) = ?", [month])
+      .where('date', 'like', `${month}%`)
       .update({ status: 'submitted' });
 
     res.json({ message: 'Schedule submitted successfully', warnings });
@@ -158,7 +158,7 @@ router.post('/unlock', requireAdmin, async (req, res) => {
     const db = getDb();
     await db('schedules')
       .where({ user_id: doctorId })
-      .whereRaw("strftime('%Y-%m', date) = ?", [month])
+      .where('date', 'like', `${month}%`)
       .update({ status: 'draft' });
     res.json({ message: 'Schedule unlocked' });
   } catch (err) { res.status(500).json({ error: err.message }); }
