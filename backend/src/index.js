@@ -43,6 +43,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
-app.listen(PORT, () => {
-  console.log(`🏥 Hospital Scheduler API running on http://localhost:${PORT}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`🏥 Hospital Scheduler API running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
