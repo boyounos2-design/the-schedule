@@ -1,13 +1,18 @@
 {
   "version": 2,
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/backend/src/index.js" },
-    { "source": "/(.*)", "destination": "/frontend/dist/$1", "check": true },
-    { "source": "/(.*)", "destination": "/frontend/dist/index.html" }
-  ],
-  "functions": {
-    "backend/src/index.js": {
-      "runtime": "nodejs20.x"
+  "builds": [
+    {
+      "src": "frontend/package.json",
+      "use": "@vercel/static-build",
+      "config": { "distDir": "dist" }
+    },
+    {
+      "src": "backend/src/index.js",
+      "use": "@vercel/node"
     }
-  }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "backend/src/index.js" },
+    { "src": "/(.*)", "dest": "frontend/$1" }
+  ]
 }
