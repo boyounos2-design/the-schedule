@@ -1,9 +1,9 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "backend/src/index.js" },
-    { "source": "/(.*)", "destination": "frontend/dist/$1", "check": true },
-    { "source": "/(.*)", "destination": "frontend/dist/index.html" }
+    { "source": "/api/(.*)", "destination": "/backend/src/index.js" },
+    { "source": "/(.*)", "destination": "/frontend/dist/$1", "check": true },
+    { "source": "/(.*)", "destination": "/frontend/dist/index.html" }
   ],
   "functions": {
     "backend/src/index.js": {
