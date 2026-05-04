@@ -1,5 +1,5 @@
 const express = require('express');
-const { getDb } = require('../db/database');
+const { admin, getDb } = require('../db/database');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
@@ -12,21 +12,45 @@ router.get('/', async (req, res) => {
   try {
     const { month, doctorId } = req.query;
     if (!month) return res.status(400).json({ error: 'month parameter required (YYYY-MM)' });
+    
     const db = getDb();
-    let query = db('schedules as s')
-      .join('users as u', 's.user_id', 'u.id')
-      .select('s.*', 'u.name as doctor_name', 'u.specialty')
-      .where('s.date', 'like', `${month}%`)
-      .orderBy(['s.date', 'u.name', 's.shift_type']);
+    const startDate = `${month}-01`;
+    const endDate = `${month}-31`; // Firestore can handle string comparison for dates
+
+    let query = db.collection('schedules')
+      .where('date', '>=', startDate)
+      .where('date', '<=', endDate);
 
     if (req.user.role === 'admin') {
-      if (doctorId) query = query.where('s.user_id', doctorId);
+      if (doctorId) query = query.where('user_id', '==', doctorId);
     } else {
-      query = query.where('s.user_id', req.user.id);
+      query = query.where('user_id', '==', req.user.id);
     }
-    const schedules = await query;
+
+    const snapshot = await query.get();
+    
+    // Fetch user names for the schedules (joins aren't possible in Firestore, so we might need a small map)
+    const userIds = [...new Set(snapshot.docs.map(doc => doc.data().user_id))];
+    const userMap = {};
+    if (userIds.length > 0) {
+      const usersSnapshot = await db.collection('users').where(admin.firestore.FieldPath.documentId(), 'in', userIds).get();
+      usersSnapshot.forEach(u => { userMap[u.id] = u.data(); });
+    }
+
+    const schedules = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return { 
+        id: doc.id, 
+        ...data, 
+        doctor_name: userMap[data.user_id]?.name || 'Unknown',
+        specialty: userMap[data.user_id]?.specialty || null
+      };
+    }).sort((a, b) => a.date.localeCompare(b.date) || a.doctor_name.localeCompare(b.doctor_name));
+
     res.json({ schedules });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // POST /api/schedules
@@ -40,59 +64,83 @@ router.post('/', async (req, res) => {
     const targetUserId = (req.user.role === 'admin' && doctorId) ? doctorId : req.user.id;
     const month = date.substring(0, 7);
 
-    // Check locked
-    const lockedCount = await db('schedules')
-      .where({ user_id: targetUserId })
-      .where('date', 'like', `${month}%`)
-      .whereIn('status', ['submitted','locked'])
-      .count('id as cnt')
-      .first();
+    // 1. Check locked
+    const snapshot = await db.collection('schedules')
+      .where('user_id', '==', targetUserId)
+      .where('date', '>=', `${month}-01`)
+      .where('date', '<=', `${month}-31`)
+      .where('status', 'in', ['submitted', 'locked'])
+      .limit(1)
+      .get();
 
-    if (lockedCount.cnt > 0 && req.user.role !== 'admin') {
+    if (!snapshot.empty && req.user.role !== 'admin') {
       return res.status(409).json({ error: 'Schedule is locked after submission. Contact admin.' });
     }
 
-    // Check quota
-    const quota = await db('quotas').where({ user_id: targetUserId, month }).first();
-    if (!quota) return res.status(409).json({ error: 'No quota set for this month. Ask admin to set your quota.' });
+    // 2. Check quota
+    const quotaDoc = await db.collection('quotas').doc(`${targetUserId}_${month}`).get();
+    if (!quotaDoc.exists) return res.status(409).json({ error: 'No quota set for this month. Ask admin to set your quota.' });
+    const quota = quotaDoc.data();
 
-    const usedRow = await db('schedules')
-      .where({ user_id: targetUserId, shift_type })
-      .where('date', 'like', `${month}%`)
-      .count('id as cnt').first();
+    // 3. Count used
+    const usedSnapshot = await db.collection('schedules')
+      .where('user_id', '==', targetUserId)
+      .where('shift_type', '==', shift_type)
+      .where('date', '>=', `${month}-01`)
+      .where('date', '<=', `${month}-31`)
+      .get();
 
-    if (usedRow.cnt >= quota[shift_type]) {
+    if (usedSnapshot.size >= (quota[shift_type] || 0)) {
       return res.status(409).json({
-        error: `Quota exceeded for ${shift_type.replace(/_/g,' ')}. Limit: ${quota[shift_type]}, Used: ${usedRow.cnt}`
+        error: `Quota exceeded for ${shift_type.replace(/_/g,' ')}. Limit: ${quota[shift_type]}, Used: ${usedSnapshot.size}`
       });
     }
 
-    try {
-      const [id] = await db('schedules').insert({ user_id: targetUserId, date, shift_type, status: 'draft' });
-      const schedule = await db('schedules').where({ id }).first();
-      res.status(201).json({ schedule });
-    } catch (err2) {
-      if (err2.message && err2.message.includes('UNIQUE')) {
-        return res.status(409).json({ error: 'This shift is already assigned for this day' });
-      }
-      throw err2;
+    // 4. Insert with unique ID
+    const scheduleId = `${targetUserId}_${date}_${shift_type}`;
+    const scheduleRef = db.collection('schedules').doc(scheduleId);
+    
+    // Check if exists
+    const existing = await scheduleRef.get();
+    if (existing.exists) {
+      return res.status(409).json({ error: 'This shift is already assigned for this day' });
     }
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    const newSchedule = {
+      user_id: targetUserId,
+      date,
+      shift_type,
+      status: 'draft',
+      created_at: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    await scheduleRef.set(newSchedule);
+    res.status(201).json({ schedule: { id: scheduleId, ...newSchedule } });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // DELETE /api/schedules/:id
 router.delete('/:id', async (req, res) => {
   try {
     const db = getDb();
-    const schedule = await db('schedules').where({ id: req.params.id }).first();
-    if (!schedule) return res.status(404).json({ error: 'Not found' });
+    const docRef = db.collection('schedules').doc(req.params.id);
+    const doc = await docRef.get();
+    
+    if (!doc.exists) return res.status(404).json({ error: 'Not found' });
+    const schedule = doc.data();
+
     if (req.user.role !== 'admin' && schedule.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
     if (schedule.status !== 'draft' && req.user.role !== 'admin') {
       return res.status(409).json({ error: 'Cannot delete: schedule is locked' });
     }
-    await db('schedules').where({ id: req.params.id }).delete();
+
+    await docRef.delete();
     res.json({ message: 'Shift removed' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // POST /api/schedules/submit
@@ -103,19 +151,23 @@ router.post('/submit', async (req, res) => {
     const db = getDb();
     const userId = req.user.id;
 
-    const quota = await db('quotas').where({ user_id: userId, month }).first();
-    const shiftsRaw = await db('schedules')
-      .select('shift_type')
-      .count('id as cnt')
-      .where({ user_id: userId })
-      .where('date', 'like', `${month}%`)
-      .groupBy('shift_type');
+    // Check quotas vs filled
+    const quotaDoc = await db.collection('quotas').doc(`${userId}_${month}`).get();
+    const snapshot = await db.collection('schedules')
+      .where('user_id', '==', userId)
+      .where('date', '>=', `${month}-01`)
+      .where('date', '<=', `${month}-31`)
+      .get();
 
     const shiftMap = {};
-    shiftsRaw.forEach(s => { shiftMap[s.shift_type] = s.cnt; });
+    snapshot.docs.forEach(doc => {
+      const st = doc.data().shift_type;
+      shiftMap[st] = (shiftMap[st] || 0) + 1;
+    });
 
     const warnings = [];
-    if (quota) {
+    if (quotaDoc.exists) {
+      const quota = quotaDoc.data();
       VALID_SHIFTS.forEach(t => {
         const used = shiftMap[t] || 0;
         if (used < (quota[t] || 0)) {
@@ -124,13 +176,19 @@ router.post('/submit', async (req, res) => {
       });
     }
 
-    await db('schedules')
-      .where({ user_id: userId, status: 'draft' })
-      .where('date', 'like', `${month}%`)
-      .update({ status: 'submitted' });
-
+    // Batch update drafts to submitted
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => {
+      if (doc.data().status === 'draft') {
+        batch.update(doc.ref, { status: 'submitted' });
+      }
+    });
+    
+    await batch.commit();
     res.json({ message: 'Schedule submitted successfully', warnings });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // PUT /api/schedules/:id (admin override)
@@ -138,16 +196,21 @@ router.put('/:id', requireAdmin, async (req, res) => {
   try {
     const { status, date, shift_type } = req.body;
     const db = getDb();
-    const schedule = await db('schedules').where({ id: req.params.id }).first();
-    if (!schedule) return res.status(404).json({ error: 'Not found' });
-    await db('schedules').where({ id: req.params.id }).update({
-      status: status || schedule.status,
-      date: date || schedule.date,
-      shift_type: shift_type || schedule.shift_type,
-    });
-    const updated = await db('schedules').where({ id: req.params.id }).first();
-    res.json({ schedule: updated });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const docRef = db.collection('schedules').doc(req.params.id);
+    const doc = await docRef.get();
+    if (!doc.exists) return res.status(404).json({ error: 'Not found' });
+
+    const updates = {};
+    if (status) updates.status = status;
+    if (date) updates.date = date;
+    if (shift_type) updates.shift_type = shift_type;
+
+    await docRef.update(updates);
+    const updated = await docRef.get();
+    res.json({ schedule: { id: updated.id, ...updated.data() } });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // POST /api/schedules/unlock (admin)
@@ -155,13 +218,26 @@ router.post('/unlock', requireAdmin, async (req, res) => {
   try {
     const { doctorId, month } = req.body;
     if (!doctorId || !month) return res.status(400).json({ error: 'doctorId and month required' });
+    
     const db = getDb();
-    await db('schedules')
-      .where({ user_id: doctorId })
-      .where('date', 'like', `${month}%`)
-      .update({ status: 'draft' });
+    const snapshot = await db.collection('schedules')
+      .where('user_id', '==', doctorId)
+      .where('date', '>=', `${month}-01`)
+      .where('date', '<=', `${month}-31`)
+      .get();
+
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => {
+      batch.update(doc.ref, { status: 'draft' });
+    });
+    
+    await batch.commit();
     res.json({ message: 'Schedule unlocked' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
+
+module.exports = router;
 
 module.exports = router;

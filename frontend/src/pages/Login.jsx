@@ -18,11 +18,19 @@ export default function LoginPage() {
     setError('');
     setLoading(true);
     try {
-      const user = await login(username, password);
-      toast.success(`Welcome back, ${user.name.split(' ')[0]}!`);
-      navigate(user.role === 'admin' ? '/admin' : '/doctor');
+      // In the new Firebase setup, login handles the username@hospital.com conversion
+      await login(username, password);
+      toast.success(`Welcome back!`);
+      // Navigation will be handled by the protected route or we can just redirect to root
+      // Since AuthProvider provides the 'user' state which updates once Firestore is ready.
+      navigate('/'); 
     } catch (err) {
-      setError(err.response?.data?.error || 'Login failed. Check your credentials.');
+      console.error('Login error:', err);
+      let msg = 'Login failed. Check your credentials.';
+      if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
+        msg = 'Invalid username or password.';
+      }
+      setError(msg);
     } finally {
       setLoading(false);
     }

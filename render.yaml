@@ -10,10 +10,6 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATABASE_URL
-        fromDatabase:
-          name: the-schedule-db
-          property: connectionString
       - key: JWT_SECRET
         generateValue: true
       - key: FRONTEND_URL
@@ -21,6 +17,8 @@ services:
           type: static
           name: the-schedule-ui
           property: url
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false # User must provide this in Render dashboard
 
   # Frontend UI
   - type: static
@@ -36,7 +34,3 @@ services:
           type: web
           name: the-schedule-api
           property: url
-
-databases:
-  - name: the-schedule-db
-    plan: free

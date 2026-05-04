@@ -1,6 +1,5 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const { getDb } = require('../db/database');
+const { admin, getDb } = require('../db/database');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
@@ -10,9 +9,12 @@ router.use(authenticateToken);
 router.get('/', requireAdmin, async (req, res) => {
   try {
     const db = getDb();
-    const doctors = await db('users').select('id', 'name', 'username', 'specialty', 'created_at').where({ role: 'doctor' }).orderBy('name');
+    const snapshot = await db.collection('users').where('role', '==', 'doctor').orderBy('name').get();
+    const doctors = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.json({ doctors });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // POST /api/doctors
@@ -20,14 +22,40 @@ router.post('/', requireAdmin, async (req, res) => {
   try {
     const { name, username, password, specialty } = req.body;
     if (!name || !username || !password) return res.status(400).json({ error: 'Name, username, and password are required' });
+    
     const db = getDb();
-    const existing = await db('users').where({ username: username.toLowerCase().trim() }).first();
-    if (existing) return res.status(409).json({ error: 'Username already in use' });
-    const hash = bcrypt.hashSync(password, 10);
-    const [id] = await db('users').insert({ name, username: username.toLowerCase().trim(), password_hash: hash, role: 'doctor', specialty: specialty || null });
-    const doctor = await db('users').select('id', 'name', 'username', 'specialty').where({ id }).first();
-    res.status(201).json({ doctor });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const email = `${username.toLowerCase().trim()}@hospital.com`; // Dummy email for Firebase Auth
+
+    // 1. Create in Firebase Auth
+    let userRecord;
+    try {
+      userRecord = await admin.auth().createUser({
+        email,
+        password,
+        displayName: name,
+      });
+    } catch (authErr) {
+      if (authErr.code === 'auth/email-already-exists') {
+        return res.status(409).json({ error: 'Username already in use' });
+      }
+      throw authErr;
+    }
+
+    // 2. Create in Firestore
+    const doctorData = {
+      name,
+      username: username.toLowerCase().trim(),
+      role: 'doctor',
+      specialty: specialty || null,
+      created_at: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    await db.collection('users').doc(userRecord.uid).set(doctorData);
+    
+    res.status(201).json({ doctor: { id: userRecord.uid, ...doctorData } });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // PUT /api/doctors/:id
@@ -35,25 +63,51 @@ router.put('/:id', requireAdmin, async (req, res) => {
   try {
     const { name, username, specialty, password } = req.body;
     const db = getDb();
-    const doc = await db('users').where({ id: req.params.id, role: 'doctor' }).first();
-    if (!doc) return res.status(404).json({ error: 'Doctor not found' });
-    const updates = { name, username, specialty: specialty || null };
-    if (password) updates.password_hash = bcrypt.hashSync(password, 10);
-    await db('users').where({ id: req.params.id }).update(updates);
-    const updated = await db('users').select('id', 'name', 'username', 'specialty').where({ id: req.params.id }).first();
-    res.json({ doctor: updated });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const docRef = db.collection('users').doc(req.params.id);
+    const doc = await docRef.get();
+    
+    if (!doc.exists || doc.data().role !== 'doctor') {
+      return res.status(404).json({ error: 'Doctor not found' });
+    }
+
+    const updates = { 
+      name: name || doc.data().name, 
+      username: username || doc.data().username, 
+      specialty: specialty !== undefined ? specialty : doc.data().specialty 
+    };
+
+    // Update Firebase Auth if needed
+    const authUpdates = { displayName: updates.name };
+    if (password) authUpdates.password = password;
+    await admin.auth().updateUser(req.params.id, authUpdates);
+
+    await docRef.update(updates);
+    const updated = await docRef.get();
+    res.json({ doctor: { id: updated.id, ...updated.data() } });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // DELETE /api/doctors/:id
 router.delete('/:id', requireAdmin, async (req, res) => {
   try {
     const db = getDb();
-    const doc = await db('users').where({ id: req.params.id, role: 'doctor' }).first();
-    if (!doc) return res.status(404).json({ error: 'Doctor not found' });
-    await db('users').where({ id: req.params.id }).delete();
+    const docRef = db.collection('users').doc(req.params.id);
+    const doc = await docRef.get();
+    
+    if (!doc.exists || doc.data().role !== 'doctor') {
+      return res.status(404).json({ error: 'Doctor not found' });
+    }
+
+    // Delete from Auth and Firestore
+    await admin.auth().deleteUser(req.params.id);
+    await docRef.delete();
+    
     res.json({ message: 'Doctor deleted successfully' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // GET /api/doctors/:id/quotas?month=YYYY-MM
@@ -62,16 +116,23 @@ router.get('/:id/quotas', async (req, res) => {
     const { month } = req.query;
     if (!month) return res.status(400).json({ error: 'month parameter required (YYYY-MM)' });
     const targetId = req.params.id;
+    
     if (req.user.role === 'doctor' && String(req.user.id) !== String(targetId)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
+
     const db = getDb();
-    let quota = await db('quotas').where({ user_id: targetId, month }).first();
-    if (!quota) {
-      quota = { user_id: targetId, month, morning_er: 0, evening_er: 0, morning_dept: 0, evening_dept: 0, surgeries: 0, clinics: 0 };
+    const quotaId = `${targetId}_${month}`;
+    const quotaDoc = await db.collection('quotas').doc(quotaId).get();
+    
+    if (!quotaDoc.exists) {
+      return res.json({ quota: { user_id: targetId, month, morning_er: 0, evening_er: 0, morning_dept: 0, evening_dept: 0, surgeries: 0, clinics: 0 } });
     }
-    res.json({ quota });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    
+    res.json({ quota: { id: quotaDoc.id, ...quotaDoc.data() } });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // PUT /api/doctors/:id/quotas
@@ -79,21 +140,29 @@ router.put('/:id/quotas', requireAdmin, async (req, res) => {
   try {
     const { month, morning_er, evening_er, morning_dept, evening_dept, surgeries, clinics } = req.body;
     if (!month) return res.status(400).json({ error: 'month required' });
+    
     const db = getDb();
-    const existing = await db('quotas').where({ user_id: req.params.id, month }).first();
+    const quotaId = `${req.params.id}_${month}`;
     const data = {
-      user_id: req.params.id, month,
-      morning_er: morning_er || 0, evening_er: evening_er || 0,
-      morning_dept: morning_dept || 0, evening_dept: evening_dept || 0, surgeries: surgeries || 0, clinics: clinics || 0,
+      user_id: req.params.id, 
+      month,
+      morning_er: Number(morning_er) || 0, 
+      evening_er: Number(evening_er) || 0,
+      morning_dept: Number(morning_dept) || 0, 
+      evening_dept: Number(evening_dept) || 0, 
+      surgeries: Number(surgeries) || 0, 
+      clinics: Number(clinics) || 0,
     };
-    if (existing) {
-      await db('quotas').where({ user_id: req.params.id, month }).update(data);
-    } else {
-      await db('quotas').insert(data);
-    }
-    const quota = await db('quotas').where({ user_id: req.params.id, month }).first();
-    res.json({ quota });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    
+    await db.collection('quotas').doc(quotaId).set(data);
+    const updated = await db.collection('quotas').doc(quotaId).get();
+    
+    res.json({ quota: { id: updated.id, ...updated.data() } });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
+
+module.exports = router;
 
 module.exports = router;

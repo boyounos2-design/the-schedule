@@ -1,29 +1,48 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { getDb } = require('../db/database');
+const { admin, getDb } = require('../db/database');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
 
 // POST /api/auth/login
+// DEPRECATED: Frontend should use Firebase Web SDK to login directly.
 router.post('/login', async (req, res) => {
+  res.status(410).json({ 
+    error: 'Direct login endpoint is deprecated.', 
+    message: 'Please use the Firebase Web SDK on the frontend to sign in.' 
+  });
+});
+
+// GET /api/auth/setup
+// TEMPORARY: Use this to seed the first admin user
+router.get('/setup', async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
-
     const db = getDb();
-    const user = await db('users').where({ username: username.toLowerCase().trim() }).first();
-
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+    const email = 'admin@hospital.com';
+    const password = 'admin123';
+    
+    let userRecord;
+    try {
+      userRecord = await admin.auth().getUserByEmail(email);
+    } catch (err) {
+      if (err.code === 'auth/user-not-found') {
+        userRecord = await admin.auth().createUser({
+          email,
+          password,
+          displayName: 'Hospital Admin',
+        });
+      } else { throw err; }
     }
 
-    const token = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({
-      token,
-      user: { id: user.id, name: user.name, username: user.username, role: user.role, specialty: user.specialty }
-    });
+    const adminData = {
+      name: 'Hospital Admin',
+      username: 'admin',
+      role: 'admin',
+      created_at: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    await db.collection('users').doc(userRecord.uid).set(adminData);
+    res.json({ message: 'Admin seeded successfully', email, password });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -31,23 +50,24 @@ router.post('/login', async (req, res) => {
 
 // GET /api/auth/me
 router.get('/me', authenticateToken, (req, res) => {
+  // authenticateToken already populates req.user from Firestore
   res.json({ user: req.user });
 });
 
 // POST /api/auth/change-password
 router.post('/change-password', authenticateToken, async (req, res) => {
   try {
-    const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Both passwords required' });
-    if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
-
-    const db = getDb();
-    const user = await db('users').where({ id: req.user.id }).first();
-    if (!bcrypt.compareSync(currentPassword, user.password_hash)) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
     }
-    const hash = bcrypt.hashSync(newPassword, 10);
-    await db('users').where({ id: req.user.id }).update({ password_hash: hash });
+
+    // Firebase Admin can update password directly without knowing the current one (Admin privilege)
+    // For user-self-service, Firebase Web SDK is usually preferred, but this works too.
+    await admin.auth().updateUser(req.user.id, {
+      password: newPassword
+    });
+
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });

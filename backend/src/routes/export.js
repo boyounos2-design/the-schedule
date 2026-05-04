@@ -1,7 +1,7 @@
 const express = require('express');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
-const { getDb } = require('../db/database');
+const { admin, getDb } = require('../db/database');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
@@ -25,18 +25,43 @@ const SHIFT_COLORS = {
   clinics: 'FF34D399',
 };
 
+// Internal helper to get joined schedules from Firestore
+async function getSchedulesWithUsers(month) {
+  const db = getDb();
+  const startDate = `${month}-01`;
+  const endDate = `${month}-31`;
+
+  const snapshot = await db.collection('schedules')
+    .where('date', '>=', startDate)
+    .where('date', '<=', endDate)
+    .get();
+
+  const userIds = [...new Set(snapshot.docs.map(doc => doc.data().user_id))];
+  const userMap = {};
+  if (userIds.length > 0) {
+    // Firestore limit for 'in' query is 30, but usually doctors are fewer than that.
+    const usersSnapshot = await db.collection('users').where(admin.firestore.FieldPath.documentId(), 'in', userIds).get();
+    usersSnapshot.forEach(u => { userMap[u.id] = u.data(); });
+  }
+
+  return snapshot.docs.map(doc => {
+    const data = doc.data();
+    return {
+      id: doc.id,
+      ...data,
+      doctor_name: userMap[data.user_id]?.name || 'Unknown',
+      specialty: userMap[data.user_id]?.specialty || '',
+    };
+  }).sort((a, b) => a.date.localeCompare(b.date) || a.doctor_name.localeCompare(b.doctor_name));
+}
+
 // GET /api/export/excel?month=YYYY-MM
 router.get('/excel', async (req, res) => {
   try {
     const { month } = req.query;
     if (!month) return res.status(400).json({ error: 'month required' });
 
-    const db = getDb();
-    const schedules = await db('schedules as s')
-      .join('users as u', 's.user_id', 'u.id')
-      .select('s.date', 'u.name as doctor_name', 'u.specialty', 's.shift_type', 's.status')
-      .where('s.date', 'like', `${month}%`)
-      .orderBy(['s.date', 'u.name', 's.shift_type']);
+    const schedules = await getSchedulesWithUsers(month);
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = 'Hospital Scheduler';
@@ -70,7 +95,7 @@ router.get('/excel', async (req, res) => {
     const doctorMap = {};
     schedules.forEach(s => { (doctorMap[s.doctor_name] = doctorMap[s.doctor_name] || []).push(s); });
     Object.entries(doctorMap).forEach(([docName, entries]) => {
-      const sheet = workbook.addWorksheet(docName.substring(0, 31));
+      const sheet = workbook.addWorksheet(docName.substring(0, 31).replace(/[\\\/\?\*\[\]]/g, ''));
       sheet.columns = [
         { header: 'Date', key: 'date', width: 14 },
         { header: 'Shift Type', key: 'shift', width: 20 },
@@ -91,7 +116,9 @@ router.get('/excel', async (req, res) => {
     res.setHeader('Content-Disposition',`attachment; filename="schedule-${month}.xlsx"`);
     await workbook.xlsx.write(res);
     res.end();
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // GET /api/export/attendance?month=YYYY-MM
@@ -100,12 +127,7 @@ router.get('/attendance', async (req, res) => {
     const { month } = req.query;
     if (!month) return res.status(400).json({ error: 'month required' });
 
-    const db = getDb();
-    const schedules = await db('schedules as s')
-      .join('users as u', 's.user_id', 'u.id')
-      .select('s.date', 'u.name as doctor_name', 'u.specialty', 's.shift_type')
-      .where('s.date', 'like', `${month}%`)
-      .orderBy(['s.date', 'u.name']);
+    const schedules = await getSchedulesWithUsers(month);
 
     const doc = new PDFDocument({ size: 'A4', margin: 40 });
     res.setHeader('Content-Type','application/pdf');
@@ -146,5 +168,7 @@ router.get('/attendance', async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
+
+module.exports = router;
 
 module.exports = router;
